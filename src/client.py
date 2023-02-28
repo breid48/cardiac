@@ -7,6 +7,9 @@ import sys
 import threading
 import time
 
+from pathlib import Path
+
+
 logger = logging.getLogger(__name__)
 
 FREQ_DEF = 5 # Default Heartbeat Rate: 5 seconds
@@ -23,18 +26,21 @@ class HeartbeatClient:
             rate (int, optional): Outgoing heartbeat rate. Defaults to FREQ_DEF.
             verbose (bool, optional): Verbose log output.
         """
-        self._socket = socket.socket(family=socket.AF_UNIX,
-                                     type=  socket.SOCK_DGRAM)
-
         self._condition = threading.Condition()
         
-        self.__pid = os.getpid()
+        self.destination = Path(destination)
+
+        self.__pid = self.get_pid()
+
+        if id:
+            self._validate_id(id)
+        else:
+            id = str(self.__pid)
+        
+        self._socket = socket.socket(family=socket.AF_UNIX,
+                                     type=  socket.SOCK_DGRAM)
         self._shutdown = False
 
-        if id is None:
-            id = str(self.__pid)
-
-        self.destination = destination
         self.id = id
         self.rate = rate
         self.verbose = verbose
@@ -53,6 +59,7 @@ class HeartbeatClient:
             try:
                 self._send(packet_type=1)
                 time.sleep(FREQ_DEF)
+
             except KeyboardInterrupt:
                 self._safe_exit()
 
@@ -73,21 +80,30 @@ class HeartbeatClient:
             self._safe_exit()
 
     def _connect(self):
-        """Create and bind socket."""
-        self._socket.connect(self.destination)
+        """Connect and bind socket."""
+        self._socket.connect(str(self.destination))
+
+    def _validate_id(self, id):
+        """Validate the requested client ID.
+
+        Ensure `self.id` is <= 12 characters, otherwise
+        it will not be able to be packed into the 12 byte
+        space in register packets.
+
+        Returns:
+            bool: True if `self.id` is valid, False otherwise.
+        """
+        if len(id) <= 12:
+            return True
+        else:
+            raise ValueError("id exceeds 12 character limit.")
         
-        # Bind socket to abstract namespace
-        self._socket.bind("")
-    
     def register(self):
         """Register the client with the server."""
         if self.verbose:
             logger.info(f"Registering Client | {self.__pid} | {self.id}")
 
-        if len(self.id) <= 12:
-            self._send(packet_type=2)
-        else:
-            raise ValueError("id exceeds maximum character limit.")
+        self._send(packet_type=2)
     
     def deregister(self):
         """Deregister the client with the server."""
@@ -137,18 +153,16 @@ class HeartbeatClient:
 
         Args:
             type_ (str): Either "heartbeat", "register", or "deregister".
-        """
-        register = True if type_ == 2 else False
-        
-        packet = bytearray(26) if register else bytearray(14)
+        """        
+        packet = bytearray(26) if type_ == 2 else bytearray(14)
 
         unix_t = time.time()
-        print(type_, unix_t, self.__pid, self.id)
 
         type_bytes = struct.pack(">b", type_)
         time_bytes = struct.pack(">d", unix_t)
-        # On a 64-bit system, max PID size is 4194304 (2 ** 22), so this will 
-        # always fit into 4 bytes.    
+
+        # On a 64-bit system, max PID size is 4194304 (2 ** 22), 
+        # so this will always fit into 4 bytes.    
         pid_bytes = struct.pack(">i", self.__pid)
 
         # Populate bytearray
@@ -156,7 +170,7 @@ class HeartbeatClient:
         packet[2:10] = time_bytes
         packet[10:14] = pid_bytes
 
-        if register:
+        if type_ == 2:
             ident_bytes = struct.pack("12s", self.id.encode("UTF-8")) 
             packet[14:26] = ident_bytes
 
@@ -180,9 +194,17 @@ class HeartbeatClient:
             - After calling safe exit (with just shutdown), calls to socket.rcvfrom() returned None, but
             the file descriptor wasn't automatically released, so calls to rcvfrom still went through.
         """
-        self.deregister()
-        self._socket.shutdown(socket.SHUT_RDWR)
-        self._socket.close()
+        try:
+            self.deregister()
 
-        if self.verbose:
-            logger.info(f"Successfully Shut Down | {self.__pid} | {self.id} |")
+        finally:
+            self._socket.shutdown(socket.SHUT_RDWR)
+            self._socket.close()
+            
+            if self.verbose:
+                logger.info(f"Successfully Shut Down | {self.__pid} | {self.id} |")
+            return
+
+    def get_pid(self):
+        """Get process ID."""
+        return os.getpid()
